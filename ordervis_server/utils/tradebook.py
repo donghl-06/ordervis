@@ -3,6 +3,7 @@ import lib.pywangcai_orderbook as wc
 import time
 import threading
 import pandas as pd
+from collections import OrderedDict
 from datetime import datetime, timedelta
 from typing import Any, Dict, Optional, Callable, Union, List
 from threading import Lock
@@ -66,6 +67,7 @@ class TradeBook:
         # 逐笔数据缓存（懒加载）
         self._csord_df: Optional[pd.DataFrame] = None
         self._cstra_df: Optional[pd.DataFrame] = None
+        self._tick_lock = Lock()
         self._order_price_map: Optional[Dict[int, float]] = None
         # 撤单修补记录缓存：{档位序号(0=一档, 1=二档): [records]}
         self._cancel_records_cache: Dict[int, List[Dict]] = {}
@@ -73,8 +75,17 @@ class TradeBook:
         self._order_meta_map: Optional[Dict[int, Dict[str, Any]]] = None
         self._passive_trade_records: Optional[List[Dict[str, Any]]] = None
 
+        # 快照 LRU 缓存：query_by_time 每次要让引擎构建完整六档快照（毫秒级），
+        # C2 流量图与锁定订单图对同一窗口的 60 个采样点会重复查询同一批时刻，
+        # 命中缓存后第二个请求几乎零成本。
+        self._snapshot_cache: "OrderedDict[str, Dict]" = OrderedDict()
+        self._snapshot_cache_lock = Lock()
+
         # 后台构建 create_time 映射，不阻塞初始化
         threading.Thread(target=self._build_order_time_map, daemon=True).start()
+        # 后台预热派生缓存（撤单修补/成交价记录），让首次跳转/首次图表加载
+        # 不再付出全量构建成本
+        threading.Thread(target=self._prewarm_derived_caches, daemon=True).start()
 
     # ---------- create_time 映射（B2） ----------
 
@@ -146,6 +157,76 @@ class TradeBook:
                 except (TypeError, ValueError):
                     order['create_time'] = None
         return snapshot
+
+    # ---------- 快照缓存与预热 ----------
+
+    def _query_by_time_cached(self, time_str: str) -> Optional[Dict]:
+        """query_by_time 的 LRU 缓存包装，以状态指纹（快照 timestamp）为键。
+
+        任意时刻 T 的快照由「最后一个 ts<=T 的盘口变化」唯一决定，md/ts
+        相同的两个时刻返回的是同一份状态。用状态时刻而非查询时刻做键，
+        不同窗口、相邻跳转的采样点只要落在同一状态就共享缓存条目。
+        共享安全性：所有调用方对快照只读，唯一例外是
+        _enrich_snapshot_create_time 往 order dict 里补 create_time —— 该写入
+        幂等（同一订单映射恒定），重复 enrich 结果一致，无需拷贝。
+        """
+        # md（微秒级）先定位状态时刻；引擎越界等异常时退回按查询时刻做键
+        md = self.visualizer.query_market_data(self.date, time_str)
+        key = (md or {}).get('timestamp') or time_str
+        with self._snapshot_cache_lock:
+            snap = self._snapshot_cache.get(key)
+            if snap is not None:
+                self._snapshot_cache.move_to_end(key)
+                return snap
+        snap = self.visualizer.query_by_time(self.date, time_str)
+        if snap is not None:
+            # 以快照自身的 timestamp 为准（md 定位存在滞后 1 位的已知坑，
+            # 键不一致只会降低命中率，不会取错状态）
+            key = snap.get('timestamp') or key
+            with self._snapshot_cache_lock:
+                self._snapshot_cache[key] = snap
+                if len(self._snapshot_cache) > 256:
+                    self._snapshot_cache.popitem(last=False)
+        return snap
+
+    def _window_market_snapshots(self, sample_times: List[str]):
+        """窗口采样点的 (market_data 列表, 完整快照列表)。
+
+        引擎 query_market_data（微秒级）能给出每个采样点所处的
+        change_index/timestamp；短窗口内相邻采样点大多处于同一盘口状态
+        （实测 3s 窗口 61 点只有约 5 个状态），而逐点 query_by_time
+        （毫秒级）会重复构建同一份六档快照。因此先按 (change_index,
+        timestamp) 把采样点分组，每组只用组内最后时刻查一次快照
+        （走 LRU 缓存，与其它窗口的采样点共享）。
+
+        已知引擎坑位：md 的 change_index 在部分时刻滞后快照 1 位。滞后
+        只影响绝对值不影响分组正确性；组状态以组内最后时刻的真实快照
+        为准（即各桶右缘口径），md 定位失效的极端边界最多让一根桶取到
+        相邻状态的一档量。
+        """
+        mds = [self.visualizer.query_market_data(self.date, t) or {} for t in sample_times]
+        keys = [(md.get('change_index'), md.get('timestamp')) for md in mds]
+        snapshots: List[Optional[Dict]] = [None] * len(sample_times)
+        i = 0
+        while i < len(sample_times):
+            j = i
+            while j + 1 < len(sample_times) and keys[j + 1] == keys[i]:
+                j += 1
+            snap = self._query_by_time_cached(sample_times[j])
+            for k in range(i, j + 1):
+                snapshots[k] = snap
+            i = j + 1
+        return mds, snapshots
+
+    def _prewarm_derived_caches(self):
+        """后台预热撤单修补与成交价记录缓存，避免首次查询时同步构建。"""
+        try:
+            self._cancel_records_at_level(0)
+            self._cancel_records_at_level(1)
+            self._get_trade_price_records(0, 1)
+            self.logger.n_log(f"派生缓存预热完成: {self.get_key()}", self.log_level.INFO)
+        except Exception as e:
+            self.logger.n_log(f"派生缓存预热失败: {self.get_key()}, 错误: {e}", self.log_level.WARNING)
 
     # ---------- 相邻变化导航（A2） ----------
 
@@ -233,15 +314,21 @@ class TradeBook:
             start_str = f"{self.date} {_ms_to_time(CONTINUOUS_AUCTION_START_MS)}"
             end_str = f"{self.date} 15:00:00.000"
             win = cancels[(cancels['datetime'] > start_str) & (cancels['datetime'] <= end_str)]
-            for _, row in win.iterrows():
-                bid_oid = int(row['bidorderid'])
-                ask_oid = int(row['askorderid'])
+            # 逐行改为纯值循环：iterrows 每行构造 Series 开销大，撤单量大时
+            # 构建耗时以秒计（见跳转性能排查文档）
+            bid_ids = win['bidorderid'].to_numpy()
+            ask_ids = win['askorderid'].to_numpy()
+            sizes = win['size'].to_numpy()
+            dt_strs = win['datetime'].astype(str).to_numpy()
+            for bid_oid, ask_oid, size, dt_str in zip(bid_ids, ask_ids, sizes, dt_strs):
+                bid_oid = int(bid_oid)
+                ask_oid = int(ask_oid)
                 oid = bid_oid if bid_oid != 0 else ask_oid
                 side = 1 if bid_oid != 0 else -1
                 price = self._order_price_map.get(oid)
                 if price is None or price == 0:
                     continue  # 市价单等无法判档
-                time_part = str(row['datetime']).split(' ')[-1]
+                time_part = dt_str.split(' ')[-1]
                 md = self.visualizer.query_market_data(self.date, time_part)
                 if not md or not md.get('market_data'):
                     continue
@@ -252,9 +339,9 @@ class TradeBook:
                 best_ask = best_asks[level_index] if len(best_asks) > level_index else None
                 price_int = round(price * 10000)
                 if side == 1 and best_bid is not None and price_int == best_bid:
-                    records.append({'time_ms': _time_to_ms(time_part), 'side': 'bid', 'volume': float(row['size'])})
+                    records.append({'time_ms': _time_to_ms(time_part), 'side': 'bid', 'volume': float(size)})
                 elif side == -1 and best_ask is not None and price_int == best_ask:
-                    records.append({'time_ms': _time_to_ms(time_part), 'side': 'ask', 'volume': float(row['size'])})
+                    records.append({'time_ms': _time_to_ms(time_part), 'side': 'ask', 'volume': float(size)})
         except Exception as e:
             self.logger.n_log(f"撤单量修补计算失败(档位{level_index + 1}): {self.get_key()}, 错误: {e}", self.log_level.ERROR)
         records = sorted(records, key=lambda r: r['time_ms'])
@@ -278,10 +365,13 @@ class TradeBook:
                 try:
                     et = self._cstra_df["exectype"].astype(str).map(self._clean_exectype)
                     trades = self._cstra_df[et == "1"]
-                    for _, row in trades.iterrows():
-                        time_part = str(row["datetime"]).split(" ")[-1]
-                        price = float(row["price"])
+                    # 纯值循环代替 iterrows（成交行可达数万，构建耗时会拖慢首次跳转）
+                    dt_strs = trades["datetime"].astype(str).to_numpy()
+                    prices = trades["price"].to_numpy()
+                    for dt_str, price in zip(dt_strs, prices):
+                        price = float(price)
                         if price > 0:
+                            time_part = dt_str.split(" ")[-1]
                             records.append({"time_ms": _time_to_ms(time_part), "price": price})
                 except Exception as e:
                     self.logger.n_log(f"成交价缓存构建失败: {self.get_key()}, 错误: {e}", self.log_level.ERROR)
@@ -312,7 +402,8 @@ class TradeBook:
             return []
 
         sample_times = [_ms_to_time(round(start_ms + i * step)) for i in range(points + 1)]
-        snapshots = [self.visualizer.query_market_data(self.date, t) for t in sample_times]
+        # 一次遍历拿全部 market_data（计数器差分用）+ 按盘口状态分组的完整快照
+        snapshots, state_snapshots = self._window_market_snapshots(sample_times)
 
         # 撤单修补：同一份日内记录同时生成桶内瞬时量和截至桶右缘的累计量。
         all_cancel_records = self._best_level_cancel_volumes(CONTINUOUS_AUCTION_START_MS - 1, end_ms)
@@ -337,7 +428,8 @@ class TradeBook:
 
         # 一档状态量必须按采样时刻读取真实快照。累计计数器只描述流量，最优价切档后
         # 无法从窗口右缘的一档反推出历史时刻的“一档”，此前的反推会产生伪 0。
-        level_snapshots = [self.visualizer.query_by_time(self.date, t) or {} for t in sample_times[1:]]
+        # 快照已按盘口状态分组获取（见 _window_market_snapshots），组内共享引用。
+        level_snapshots = [s or {} for s in state_snapshots[1:]]
 
         def _level_price(bucket_index, side):
             levels = level_snapshots[bucket_index].get("levels") or {}
@@ -424,7 +516,7 @@ class TradeBook:
     def get_snapshot_by_time(self, time: str):
         """按照时间查询快照"""
         self.update_access_time()
-        return self._enrich_snapshot_create_time(self.visualizer.query_by_time(self.date, time))
+        return self._enrich_snapshot_create_time(self._query_by_time_cached(time))
 
     def get_snapshot_by_id(self, id: int):
         """按照id查询快照"""
@@ -585,42 +677,59 @@ class TradeBook:
         return s.strip()
 
     def _load_tick_data(self):
-        """懒加载本标的的 csord/cstra CSV"""
-        if self._csord_df is None and os.path.exists(self._csord_path()):
-            self._csord_df = pd.read_csv(self._csord_path())
-        if self._cstra_df is None and os.path.exists(self._cstra_path()):
-            self._cstra_df = pd.read_csv(self._cstra_path())
+        """懒加载本标的的 csord/cstra CSV（预热线程与请求并发时避免重复读取）"""
+        if self._csord_df is not None and self._cstra_df is not None:
+            return
+        with self._tick_lock:
+            if self._csord_df is None and os.path.exists(self._csord_path()):
+                self._csord_df = pd.read_csv(self._csord_path())
+            if self._cstra_df is None and os.path.exists(self._cstra_path()):
+                self._cstra_df = pd.read_csv(self._cstra_path())
 
-    def _queue_positions_at(self, time_str: str, order_ids: List[int]) -> Dict[int, Dict]:
-        """在指定时刻的一次快照中批量定位订单，返回队列位置与身前/身后量"""
+    @staticmethod
+    def _queue_positions_in_snapshot(snap: Optional[Dict], wanted: set) -> Dict[int, Dict]:
+        """在一次快照中批量定位订单，返回队列位置与身前/身后量。
+
+        身前/身后量用一次前缀和遍历得出（原实现对每个命中订单做两次
+        切片 sum，是 O(n^2)，锁定图 60 个采样点下显著拖慢跳转）。
+        """
         try:
-            snap = self.visualizer.query_by_time(self.date, time_str)
             if not snap:
                 return {}
-            wanted = {int(order_id) for order_id in order_ids}
             positions = {}
             for level_key, level in snap.get('levels', {}).items():
                 orders = level.get('orders', [])
+                # 前缀和：ahead[i] = 前 i 笔订单的 remaining_volume 之和
+                ahead = 0
+                ahead_sums = []
+                for o in orders:
+                    ahead_sums.append(ahead)
+                    ahead += int(o.get('remaining_volume', 0) or 0)
+                level_total = ahead
                 for i, o in enumerate(orders):
                     try:
                         current_id = int(o.get('order_local_id', -1))
                     except (TypeError, ValueError):
                         continue
                     if current_id in wanted:
-                        ahead = sum(int(x.get('remaining_volume', 0)) for x in orders[:i])
-                        behind = sum(int(x.get('remaining_volume', 0)) for x in orders[i + 1:])
+                        own = int(o.get('remaining_volume', 0) or 0)
                         positions[current_id] = {
                             'level': level_key,
                             'price': level.get('price'),
                             'position': i + 1,
                             'level_order_count': len(orders),
-                            'remaining_volume': float(o.get('remaining_volume', 0) or 0),
-                            'ahead_volume': ahead,
-                            'behind_volume': behind,
+                            'remaining_volume': float(own),
+                            'ahead_volume': ahead_sums[i],
+                            'behind_volume': level_total - ahead_sums[i] - own,
                         }
             return positions
         except Exception:
             return {}
+
+    def _queue_positions_at(self, time_str: str, order_ids: List[int]) -> Dict[int, Dict]:
+        """在指定时刻的快照中定位订单，返回队列位置与身前/身后量"""
+        wanted = {int(order_id) for order_id in order_ids}
+        return self._queue_positions_in_snapshot(self._query_by_time_cached(time_str), wanted)
 
     def _queue_position_at(self, time_str: str, order_id: int) -> Optional[Dict]:
         """在指定时刻的快照中定位订单，返回队列位置与身前/身后量"""
@@ -647,9 +756,12 @@ class TradeBook:
             return []
 
         sample_times = [_ms_to_time(round(start_ms + i * step)) for i in range(points + 1)]
+        # 按盘口状态分组获取快照（窗口内多数采样点状态相同，避免逐点全量查询）
+        _, state_snapshots = self._window_market_snapshots(sample_times[1:])
+        wanted = set(unique_ids)
         series = []
-        for sample_time in sample_times[1:]:
-            positions = self._queue_positions_at(sample_time, unique_ids)
+        for sample_time, snap in zip(sample_times[1:], state_snapshots):
+            positions = self._queue_positions_in_snapshot(snap, wanted)
             series.append({
                 'time': sample_time,
                 'orders': {
@@ -665,20 +777,17 @@ class TradeBook:
         if self._order_meta_map is None:
             order_meta: Dict[int, Dict[str, Any]] = {}
             if self._csord_df is not None:
-                for _, row in self._csord_df.iterrows():
+                # 纯值循环代替 iterrows（订单数可达数万，原构建以秒计）
+                order_ids = self._csord_df['orderid'].to_numpy()
+                dt_strs = self._csord_df['datetime'].astype(str).to_numpy()
+                sides = self._csord_df['side'].to_numpy()
+                prices = self._csord_df['price'].to_numpy()
+                for order_id, dt_str, side, price in zip(order_ids, dt_strs, sides, prices):
                     try:
-                        order_id = int(row['orderid'])
-                        timestamp = pd.Timestamp(row['datetime'])
-                        time_ms = (
-                            timestamp.hour * 3600000
-                            + timestamp.minute * 60000
-                            + timestamp.second * 1000
-                            + timestamp.microsecond // 1000
-                        )
-                        order_meta[order_id] = {
-                            'time_ms': time_ms,
-                            'side': int(row['side']),
-                            'price': float(row['price']),
+                        order_meta[int(order_id)] = {
+                            'time_ms': _time_to_ms(dt_str.split(' ')[-1]),
+                            'side': int(side),
+                            'price': float(price),
                         }
                     except (TypeError, ValueError, KeyError):
                         continue
@@ -692,18 +801,17 @@ class TradeBook:
             exectypes = self._cstra_df['exectype'].astype(str).map(self._clean_exectype)
             trades = self._cstra_df[exectypes == '1']
             order_meta = self._order_meta_map or {}
-            for _, row in trades.iterrows():
+            dt_strs = trades['datetime'].astype(str).to_numpy()
+            bid_ids = trades['bidorderid'].to_numpy()
+            ask_ids = trades['askorderid'].to_numpy()
+            flags = trades['tradebsflag'].astype(str).to_numpy() if 'tradebsflag' in trades.columns else None
+            sizes = trades['size'].to_numpy()
+            prices = trades['price'].to_numpy()
+            for i, dt_str in enumerate(dt_strs):
                 try:
-                    timestamp = pd.Timestamp(row['datetime'])
-                    time_ms = (
-                        timestamp.hour * 3600000
-                        + timestamp.minute * 60000
-                        + timestamp.second * 1000
-                        + timestamp.microsecond // 1000
-                    )
-                    bid_id = int(row['bidorderid'])
-                    ask_id = int(row['askorderid'])
-                    flag = self._clean_exectype(row.get('tradebsflag', '0')).upper()
+                    bid_id = int(bid_ids[i])
+                    ask_id = int(ask_ids[i])
+                    flag = self._clean_exectype(flags[i] if flags is not None else '0').upper()
 
                     # B/S 表示主动买/主动卖；部分市场（如上交所）恒为 0，
                     # 此时用双方订单创建先后判断较早进入盘口的被动侧。
@@ -723,12 +831,12 @@ class TradeBook:
 
                     if passive_side is None:
                         continue
-                    volume = float(row['size'])
-                    price = float(row['price'])
+                    volume = float(sizes[i])
+                    price = float(prices[i])
                     if volume <= 0 or price <= 0:
                         continue
                     records.append({
-                        'time_ms': time_ms,
+                        'time_ms': _time_to_ms(dt_str.split(' ')[-1]),
                         'side': passive_side,
                         'price': price,
                         'volume': volume,
@@ -822,7 +930,7 @@ class TradeBook:
             }
 
         def _level2_volume(time_ms: int) -> float:
-            snap = self.visualizer.query_by_time(self.date, _ms_to_time(time_ms)) or {}
+            snap = self._query_by_time_cached(_ms_to_time(time_ms)) or {}
             level = (snap.get('levels') or {}).get(f'{side}2') or {}
             return float(level.get('total_volume') or 0)
 
@@ -969,7 +1077,7 @@ class TradeBook:
         side_sign = 1 if side_key == 'bid' else -1
         side_label = '买' if side_key == 'bid' else '卖'
 
-        snap = self.visualizer.query_by_time(self.date, time_str) or {}
+        snap = self._query_by_time_cached(time_str) or {}
         levels = snap.get('levels') or {}
         higher_levels_volume = 0.0
         for r in range(1, rank):
