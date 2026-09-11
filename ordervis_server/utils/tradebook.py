@@ -13,6 +13,23 @@ from ordervis_server.package import backend_logger
 
 # 连续竞价开始时间（引擎 market_data 在该时间前无效）
 CONTINUOUS_AUCTION_START_MS = 9 * 3600000 + 30 * 60000  # 09:30:00.000
+AFTERNOON_START_MS = 13 * 3600000                       # 13:00:00.000
+CLOSE_MS = 15 * 3600000                                 # 15:00:00.000
+
+# 定向状态预热参数（见 _prewarm_states_worker）：网格粒度捕获 ≥10ms 的
+# 盘口状态（002156 密集时段状态间隔可低至 20–30ms，25ms 网格会漏掉一批，
+# 请求采样网格相位一偏就踩中漏网状态——曾致连跳尖刺 4s）；前向按状态数
+# 预算自适应；后向覆盖「窗口宽度 + 常见回看步长」；每次真实构建后让出
+# GIL 的时间；唤醒后先静默等待（连跳期间 worker 不启动，避免与请求抢
+# GIL 重复构建）。快照 LRU 上限 1024：实测 002156 极端高频日单快照深度
+# 内存约 67KB，1024 条上限约 68MB，且能同时容纳预热范围与多个窗口的
+# 请求工作集（256 时两三个窗口就互相挤掉）。
+PREWARM_GRID_STEP_MS = 10
+PREWARM_FORWARD_STATES = 96
+PREWARM_BACKWARD_MS = 4000
+PREWARM_BUILD_THROTTLE_S = 0.01
+PREWARM_DEBOUNCE_S = 0.3
+SNAPSHOT_CACHE_LIMIT = 1024
 
 
 def _time_to_ms(time_str: str) -> int:
@@ -86,6 +103,15 @@ class TradeBook:
         # 后台预热派生缓存（撤单修补/成交价记录），让首次跳转/首次图表加载
         # 不再付出全量构建成本
         threading.Thread(target=self._prewarm_derived_caches, daemon=True).start()
+
+        # 定向状态预热：用户停留时刻（anchor）驱动的快照预建。查询方法
+        # 完成后记录锚点并唤醒常驻 worker，generation 递增使旧扫描作废
+        # （见 _prewarm_states_worker）。_prewarm_busy 仅供测试/观测。
+        self._prewarm_anchor_ms: Optional[int] = None
+        self._prewarm_generation = 0
+        self._prewarm_wakeup = threading.Event()
+        self._prewarm_busy = False
+        threading.Thread(target=self._prewarm_states_worker, daemon=True).start()
 
     # ---------- create_time 映射（B2） ----------
 
@@ -185,7 +211,7 @@ class TradeBook:
             key = snap.get('timestamp') or key
             with self._snapshot_cache_lock:
                 self._snapshot_cache[key] = snap
-                if len(self._snapshot_cache) > 256:
+                if len(self._snapshot_cache) > SNAPSHOT_CACHE_LIMIT:
                     self._snapshot_cache.popitem(last=False)
         return snap
 
@@ -227,6 +253,113 @@ class TradeBook:
             self.logger.n_log(f"派生缓存预热完成: {self.get_key()}", self.log_level.INFO)
         except Exception as e:
             self.logger.n_log(f"派生缓存预热失败: {self.get_key()}, 错误: {e}", self.log_level.WARNING)
+
+    # ---------- 定向状态预热（用户停留位置驱动） ----------
+
+    def _schedule_state_prewarm(self, time_str: str):
+        """记录最新停留时刻并唤醒状态预热线程；代际递增使进行中的旧扫描作废。"""
+        try:
+            anchor_ms = _time_to_ms(time_str)
+        except (TypeError, ValueError):
+            return
+        self._prewarm_anchor_ms = anchor_ms
+        self._prewarm_generation += 1
+        self._prewarm_wakeup.set()
+
+    @staticmethod
+    def _session_end_for_time(time_ms: int) -> int:
+        """所在连续竞价时段的结束时刻（午休前 11:30 / 收盘 15:00）。"""
+        return AFTERNOON_START_MS if time_ms < AFTERNOON_START_MS else CLOSE_MS
+
+    def _pick_prewarm_horizon_ms(self, anchor_ms: int) -> int:
+        """按状态数预算自适应选择前向范围。
+
+        用微秒级的 query_market_data 探 change_index 跨度，候选里取跨度
+        不超过 PREWARM_FORWARD_STATES 的最大者：稀疏标的可覆盖 30–60s
+        （多数大步档位也命中），002156 这类高频标的收敛到 3s（约 44 个
+        状态）。md.change_index 滞后 1 位的已知坑只让跨度估计偏差 1，
+        不影响选择结果。
+        """
+        base = self.visualizer.query_market_data(self.date, _ms_to_time(anchor_ms)) or {}
+        try:
+            idx0 = int(base.get('change_index') or 0)
+        except (TypeError, ValueError):
+            return 3000
+        for horizon_ms in (60000, 30000, 10000, 4000):
+            md = self.visualizer.query_market_data(self.date, _ms_to_time(anchor_ms + horizon_ms)) or {}
+            try:
+                span = int(md.get('change_index') or idx0) - idx0
+            except (TypeError, ValueError):
+                span = 0
+            if span <= PREWARM_FORWARD_STATES:
+                return horizon_ms
+        return 4000
+
+    def _prewarm_states_worker(self):
+        """后台把停留时刻前后的盘口状态预建进快照 LRU。
+
+        唤醒后先静默 PREWARM_DEBOUNCE_S 再重读锚点开工：用户连跳期间
+        worker 完全不启动（每步都重置静默期），避免与请求抢 GIL 重复
+        构建；真正「停留」后才投机预热。顺序上先扫 [anchor-4s, anchor)
+        再扫 [anchor, anchor+H]：后向与跳转刚触发的图表请求窗口重合且
+        覆盖回看步长的左溢出段；前向覆盖小步/大步步进后的新窗口。网格
+        点先做 md+dict 命中预检，已缓存状态零成本跳过；真实构建后
+        sleep 让出 GIL——引擎调用不释放 GIL，不节流的话预热线程会按
+        单次构建时长（高频标的 ~92ms）为单位卡住事件循环。范围钳制在
+        所在竞价时段内，避免午休/收盘后的海量无效网格点。新跳转到来时
+        代际变化使当前扫描立即作废（已建部分保留在 LRU 里）。
+        """
+        while True:
+            self._prewarm_wakeup.wait()
+            self._prewarm_wakeup.clear()
+            time.sleep(PREWARM_DEBOUNCE_S)
+            generation = self._prewarm_generation
+            anchor_ms = self._prewarm_anchor_ms
+            if anchor_ms is None:
+                continue
+            self._prewarm_busy = True
+            try:
+                session_lo = self._session_start_for_time(anchor_ms)
+                session_hi = self._session_end_for_time(anchor_ms)
+                try:
+                    horizon_ms = self._pick_prewarm_horizon_ms(anchor_ms)
+                except Exception as e:
+                    self.logger.n_log(f"状态预热范围探测失败: {self.get_key()}, 错误: {e}", self.log_level.WARNING)
+                    continue
+                ranges = (
+                    (anchor_ms - PREWARM_BACKWARD_MS, anchor_ms - PREWARM_GRID_STEP_MS),
+                    (anchor_ms, anchor_ms + horizon_ms),
+                )
+                built, stale = 0, False
+                for lo_ms, hi_ms in ranges:
+                    if stale:
+                        break
+                    lo_ms = max(lo_ms, session_lo)
+                    hi_ms = min(hi_ms, session_hi)
+                    for t_ms in range(lo_ms, hi_ms + 1, PREWARM_GRID_STEP_MS):
+                        if self._prewarm_generation != generation:
+                            stale = True
+                            break
+                        time_str = _ms_to_time(t_ms)
+                        md = self.visualizer.query_market_data(self.date, time_str)
+                        key = (md or {}).get('timestamp') or time_str
+                        with self._snapshot_cache_lock:
+                            if key in self._snapshot_cache:
+                                continue
+                        try:
+                            self._query_by_time_cached(time_str)
+                        except Exception:
+                            continue  # 引擎越界等异常：跳过该点继续扫
+                        built += 1
+                        time.sleep(PREWARM_BUILD_THROTTLE_S)
+                if built or stale:
+                    self.logger.n_log(
+                        f"状态预热{'中断' if stale else '完成'}: {self.get_key()}, "
+                        f"anchor={_ms_to_time(anchor_ms)}, 前向={horizon_ms}ms, 新建 {built} 个状态",
+                        self.log_level.INFO,
+                    )
+            finally:
+                self._prewarm_busy = False
 
     # ---------- 相邻变化导航（A2） ----------
 
@@ -475,6 +608,7 @@ class TradeBook:
                 'ask_price': _level_price(i, 'ask'),
                 'trade_prices': trade_prices[i],
             })
+        self._schedule_state_prewarm(time_str)
         return series
 
     @classmethod
@@ -516,7 +650,10 @@ class TradeBook:
     def get_snapshot_by_time(self, time: str):
         """按照时间查询快照"""
         self.update_access_time()
-        return self._enrich_snapshot_create_time(self._query_by_time_cached(time))
+        try:
+            return self._enrich_snapshot_create_time(self._query_by_time_cached(time))
+        finally:
+            self._schedule_state_prewarm(time)
 
     def get_snapshot_by_id(self, id: int):
         """按照id查询快照"""
@@ -769,6 +906,7 @@ class TradeBook:
                     for order_id in unique_ids
                 },
             })
+        self._schedule_state_prewarm(time_str)
         return series
 
     def _ensure_execution_prediction_cache(self):
