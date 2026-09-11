@@ -1275,6 +1275,9 @@
 
     const selectSymItem = (item) => {
       selectSym.value = item
+      // 输入已被点选消费，清掉搜索缓存，避免 blur 时残留串覆盖本次选择
+      symSearchValue.value = ''
+      symLastValidInput.value = ''
       securityType.value = getSecurityType(item)
       localStorage.setItem('volumeQueue_securityType', securityType.value)
       localStorage.setItem('volumeQueue_selectSym', item)
@@ -1311,6 +1314,9 @@
       selectDate.value = item
       localStorage.setItem('volumeQueue_selectDate', item)
       hasDate.value = true
+      // 输入已被点选消费，清掉搜索缓存，避免 blur 时残留串覆盖本次选择
+      dateSearchValue.value = ''
+      dateLastValidInput.value = ''
     }
 
     // 存储用户输入的搜索内容
@@ -1355,36 +1361,30 @@
     const handleSymBlur = () => {
       // 使用setTimeout确保在blur事件后执行，避免与Select组件内部逻辑冲突
       setTimeout(() => {
-        // 优先使用最后有效输入，然后是当前搜索值，最后是选中值
-        const searchInput = symLastValidInput.value || symSearchValue.value || selectSym.value;
+        // 当前选中值已是合法选项时，尊重用户的精确选择，不做任何覆盖
+        // （与日期侧同理：防止残留搜索串的模糊匹配覆盖用户点选的结果）
+        const currentValid = filteredSymsData.value.find(option =>
+          option.value.toLowerCase() === String(selectSym.value || '').toLowerCase()
+        );
+        if (currentValid) {
+          symSearchValue.value = '';
+          symLastValidInput.value = '';
+          return;
+        }
 
-        if (searchInput && searchInput.trim() !== '') {
-          const currentValue = searchInput.trim();
-
-          // 先查找完全匹配的选项
-          let matchingOption = filteredSymsData.value.find(option =>
-            option.value.toLowerCase() === currentValue.toLowerCase()
+        // 仅当当前值为空/无效时，才用未提交的输入回填；只认完全匹配
+        const searchInput = (symLastValidInput.value || symSearchValue.value || '').trim();
+        if (searchInput) {
+          const matchingOption = filteredSymsData.value.find(option =>
+            option.value.toLowerCase() === searchInput.toLowerCase()
           );
 
-          // 如果没有完全匹配，查找包含输入内容的选项
-          if (!matchingOption) {
-            matchingOption = filteredSymsData.value.find(option =>
-              option.value.toLowerCase().includes(currentValue.toLowerCase())
-            );
-          }
-
-          // 如果找到匹配项，则选择它
           if (matchingOption) {
-            selectSym.value = matchingOption.value;
-            if (!hasSymbol.value) {
-              selectSymItem(matchingOption.value);
-            }
+            selectSymItem(matchingOption.value);
           } else {
             // 如果没有找到匹配项，清空输入并提示用户
             selectSym.value = '';
-            symSearchValue.value = '';
-            symLastValidInput.value = '';
-            createMessage.warning(`未找到匹配的${securityType.value === 'fund' ? '基金' : '股票'}代码: ${currentValue}`);
+            createMessage.warning(`未找到匹配的${securityType.value === 'fund' ? '基金' : '股票'}代码: ${searchInput}`);
           }
         }
 
@@ -1398,40 +1398,37 @@
     const handleDateBlur = () => {
       // 使用setTimeout确保在blur事件后执行，避免与Select组件内部逻辑冲突
       setTimeout(() => {
-        // 优先使用最后有效输入，然后是当前搜索值，最后是选中值
-        const searchInput = dateLastValidInput.value || dateSearchValue.value || selectDate.value;
+        // 当前选中值已是合法选项时，尊重用户的精确选择，不做任何覆盖。
+        // （修复：搜索过滤后点选相邻日期，曾被残留搜索串的模糊匹配覆盖回旧日期）
+        const currentValid = datesData.value.find(option =>
+          option.value.toLowerCase() === String(selectDate.value || '').toLowerCase()
+        );
+        if (currentValid) {
+          dateSearchValue.value = '';
+          dateLastValidInput.value = '';
+          return;
+        }
 
-        if (searchInput && searchInput.trim() !== '') {
-          const currentValue = searchInput.trim();
-
-          // 先查找完全匹配的选项
-          let matchingOption = datesData.value.find(option =>
-            option.value.toLowerCase() === currentValue.toLowerCase()
+        // 仅当当前值为空/无效时，才用未提交的输入回填；只认完全匹配——
+        // 部分串匹配在降序列表里命中哪天不可预测，不再自动选中
+        const searchInput = (dateLastValidInput.value || dateSearchValue.value || '').trim();
+        if (searchInput) {
+          const matchingOption = datesData.value.find(option =>
+            option.value.toLowerCase() === searchInput.toLowerCase()
           );
 
-          // 如果没有完全匹配，查找包含输入内容的选项
-          if (!matchingOption) {
-            matchingOption = datesData.value.find(option =>
-              option.value.toLowerCase().includes(currentValue.toLowerCase())
-            );
-          }
-
-          // 如果找到匹配项，则选择它
           if (matchingOption) {
-            selectDate.value = matchingOption.value;
-            if (!hasDate.value) {
-              selectDateItem(matchingOption.value);
-            }
+            selectDateItem(matchingOption.value);
           } else {
             // 如果没有找到匹配项，清空输入并提示用户
             selectDate.value = '';
-            dateSearchValue.value = '';
-            createMessage.warning(`未找到匹配的日期: ${currentValue}`);
+            createMessage.warning(`未找到匹配的日期: ${searchInput}`);
           }
         }
 
         // 清空搜索值
         dateSearchValue.value = '';
+        dateLastValidInput.value = '';
       }, 100);
     }
 
@@ -1698,6 +1695,20 @@
     }
 
     const getOrderbookData = async () => {
+      // 用户可能输入了完整日期但未点选下拉选项就点「开始」：先同步未提交的输入，
+      // 避免 blur 的 100ms 延迟让请求仍带旧日期（加载成旧日期的数据）
+      const pendingDate = (dateLastValidInput.value || dateSearchValue.value || '').trim();
+      if (pendingDate) {
+        const exactDate = datesData.value.find(option =>
+          option.value.toLowerCase() === pendingDate.toLowerCase()
+        );
+        if (exactDate && exactDate.value !== selectDate.value) {
+          selectDateItem(exactDate.value);
+        } else if (!exactDate) {
+          createMessage.warning(`输入的日期 "${pendingDate}" 未完全匹配，将使用当前选中的 ${selectDate.value || '（空）'}`);
+        }
+      }
+
       // 首先调用初始化任务API
       try {
         initProgress.value.show = true;
