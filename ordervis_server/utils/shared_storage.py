@@ -43,6 +43,12 @@ class SharedTradeBookStorage:
         
         # 本地锁（用于线程安全）
         self.local_lock = threading.Lock()
+
+        # 初始化全局串行锁：不同标的的 TradeBook 重建若并发，C++ 引擎会
+        # 互相踩内存抛 std::bad_alloc（2026-09-11 实测：561790.SH 与
+        # 512010.SH/002156.SZ 并发初始化双双失败，单跑均成功）。引擎重建
+        # 不释放 GIL，并发初始化本来也没有吞吐收益，串行排队即可。
+        self._init_lock = threading.Lock()
         
         # 配置
         self.cleanup_interval = cleanup_interval
@@ -278,9 +284,13 @@ class SharedTradeBookStorage:
 
                 callback = create_progress_callback(task_id, 50, 99)
                 self.logger.n_log(f"[DEBUG] 开始创建TradeBook, is_ETF={is_etf}", self.log_level.DEBUG)
-                tradebook = TradeBook.create_with_progress(
-                    symbol, date, DATA_PATH, callback, is_ETF=is_etf
-                )
+                # 仅 C++ 引擎重建需要串行（数据下载/转换不参与，避免网络慢阻塞他人）
+                if self._init_lock.locked():
+                    progress_manager.update_progress(task_id, 50, "排队等待其它标的初始化完成...")
+                with self._init_lock:
+                    tradebook = TradeBook.create_with_progress(
+                        symbol, date, DATA_PATH, callback, is_ETF=is_etf
+                    )
 
                 with self.local_lock:
                     self.local_cache[key] = tradebook
