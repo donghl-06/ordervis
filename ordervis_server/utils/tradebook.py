@@ -1,6 +1,7 @@
 
 import lib.pywangcai_orderbook as wc
 import time
+from time import perf_counter as _perf_counter
 import threading
 import pandas as pd
 from collections import OrderedDict
@@ -186,7 +187,7 @@ class TradeBook:
 
     # ---------- 快照缓存与预热 ----------
 
-    def _query_by_time_cached(self, time_str: str) -> Optional[Dict]:
+    def _query_by_time_cached(self, time_str: str, from_prewarm: bool = False) -> Optional[Dict]:
         """query_by_time 的 LRU 缓存包装，以状态指纹（快照 timestamp）为键。
 
         任意时刻 T 的快照由「最后一个 ts<=T 的盘口变化」唯一决定，md/ts
@@ -195,6 +196,8 @@ class TradeBook:
         共享安全性：所有调用方对快照只读，唯一例外是
         _enrich_snapshot_create_time 往 order dict 里补 create_time —— 该写入
         幂等（同一订单映射恒定），重复 enrich 结果一致，无需拷贝。
+
+        from_prewarm=True 时不打构建耗时日志（预热线程批量构建会刷屏）。
         """
         # md（微秒级）先定位状态时刻；引擎越界等异常时退回按查询时刻做键
         md = self.visualizer.query_market_data(self.date, time_str)
@@ -204,7 +207,14 @@ class TradeBook:
             if snap is not None:
                 self._snapshot_cache.move_to_end(key)
                 return snap
+        t0 = _perf_counter()
         snap = self.visualizer.query_by_time(self.date, time_str)
+        if not from_prewarm:
+            self.logger.n_log(
+                f"[PERF] 快照构建(缓存未命中): {self.get_key()} {time_str} → "
+                f"{(_perf_counter() - t0) * 1000:.1f}ms",
+                self.log_level.INFO,
+            )
         if snap is not None:
             # 以快照自身的 timestamp 为准（md 定位存在滞后 1 位的已知坑，
             # 键不一致只会降低命中率，不会取错状态）
@@ -347,7 +357,7 @@ class TradeBook:
                             if key in self._snapshot_cache:
                                 continue
                         try:
-                            self._query_by_time_cached(time_str)
+                            self._query_by_time_cached(time_str, from_prewarm=True)
                         except Exception:
                             continue  # 引擎越界等异常：跳过该点继续扫
                         built += 1

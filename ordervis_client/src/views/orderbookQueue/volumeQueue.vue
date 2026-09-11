@@ -1204,9 +1204,10 @@
     // ==================== 第 4 步：布局与视觉重构新增状态 ====================
 
     // A1 步进颗粒度选择器（预设为毫秒数，支持输入「数字+ms/s/min」自定义）
-    // 小步上限 500ms、大步入门 1s，两档预设不重叠
+    // 小步上限 500ms、大步入门 1s，两档预设不重叠；
+    // 小步最小 10ms——订单最小时间间隔就是 10ms，更小的步长无意义
     const smallStepMs = ref(30);
-    const smallStepOptions = [5, 10, 30, 50, 100, 200, 500];
+    const smallStepOptions = [10, 30, 50, 100, 200, 500];
     const bigStepMs = ref(1000);
     const bigStepOptions = [1000, 3000, 5000, 10000, 30000, 60000, 300000];
     const orderStep = ref(1);
@@ -1527,6 +1528,9 @@
 
     const processVolumeData = (timeValue, skipProgressUpdate = false, isInitialLoad = false, isTimeJump = false) => {
       loading.value = true
+      // 记录跳转前位置，吸附时用于计算实际位移（弹窗展示）
+      const prevTime = selectTime.value;
+      const prevOrderIndex = orderIndex.value;
       let params = {
         sym: selectSym.value,
         date: selectDate.value,
@@ -1606,9 +1610,9 @@
             selectTime.value = checkResult.corrected;
             localStorage.setItem('volumeQueue_timestamp', checkResult.corrected);
 
-            // 时间跳转时，若实际快照时间与输入时间不一致，提示用户
+            // 时间跳转时，若实际快照时间与输入时间不一致，提示用户并附实际位移
             if (isTimeJump && timeValue && extractedTime && extractedTime !== timeValue) {
-              createMessage.warning(`目标时间 ${timeValue} 无对应快照，已跳转到 ${extractedTime}`);
+              createMessage.warning(`目标时间 ${timeValue} 无对应快照，已跳转到 ${extractedTime}${formatJumpShift(prevTime, prevOrderIndex, extractedTime, snapshot.snapshot_id || res.data.orderindex)}`);
             }
           }
 
@@ -1834,8 +1838,24 @@
     // A2：通过 next_change 接口实现高效步进，每次最多 2 个请求
     // 第 1 个请求查目标时间快照；若快照时间戳与当前相同（区间内无变化），
     // 第 2 个请求用 next_change 直接取相邻的下一个/上一个变化点。
+    // 跳转位移描述：从「跳转前位置」到「实际落点」的时间差与订单数差。
+    // 仅在发生吸附/偏移（实际落点 ≠ 请求目标）时追加到弹窗文案尾部。
+    const formatJumpShift = (prevTime, prevOrderIndex, landedTime, landedOrderIndex) => {
+      const parts = [];
+      // 注意 parseTimeToMs 对非法输入返回 0 而非 NaN，必须先校验非空
+      if (prevTime && landedTime) {
+        const diffMs = Math.abs(parseTimeToMs(landedTime) - parseTimeToMs(prevTime));
+        const timeDesc = diffMs >= 1000 ? `${Number((diffMs / 1000).toFixed(3))}秒` : `${diffMs}毫秒`;
+        parts.push(`本次共跳转 ${timeDesc}`);
+      }
+      const orderDiff = Math.abs(Number(landedOrderIndex || 0) - Number(prevOrderIndex || 0));
+      parts.push(`跨过 ${orderDiff} 个订单`);
+      return `（${parts.join('，')}）`;
+    };
+
     const moveTimes = async (intevel) => {
       const currentTime = selectTime.value;
+      const prevOrderIndex = orderIndex.value;
       let totalMs = parseTimeToMs(currentTime) + intevel;
 
       // 确保时间在交易时间范围内 (09:30:00.000 - 15:00:00.000)
@@ -1870,7 +1890,7 @@
             updateMarketData();
 
             if (returnedTime !== newTime) {
-              createMessage.info(`目标时间 ${newTime} 无新快照，已自动跳转到 ${returnedTime}`);
+              createMessage.info(`目标时间 ${newTime} 无新快照，已自动跳转到 ${returnedTime}${formatJumpShift(currentTime, prevOrderIndex, returnedTime, orderIndex.value)}`);
             } else {
               createMessage.success(`时间移动成功：${moveDesc}`);
             }
@@ -1884,7 +1904,7 @@
             updateVolumeDataFromSnapshot(nc.data.snapshot, nc.data);
             updateMarketData();
             const ncTime = extractTimeFromTimestamp(nc.data.snapshot.timestamp || '');
-            createMessage.info(`${newTime} 附近无变化，已跳转到${direction > 0 ? '下一个' : '上一个'}变化点 ${ncTime}`);
+            createMessage.info(`${newTime} 附近无变化，已跳转到${direction > 0 ? '下一个' : '上一个'}变化点 ${ncTime}${formatJumpShift(currentTime, prevOrderIndex, ncTime, orderIndex.value)}`);
             return;
           }
 
@@ -2041,6 +2061,9 @@
     };
 
     const moveticks = (intevel) => {
+      const prevTime = selectTime.value;
+      const prevOrderIndex = orderIndex.value;
+      const prevChangeIndex = changeIndex.value;
       let newChangeIndex = changeIndex.value + intevel
       loading.value = true
       let params = {
@@ -2114,8 +2137,10 @@
             localStorage.setItem('volumeQueue_timestamp', checkResult.corrected);
           }
 
-          // 更新change_index为新的值
-          changeIndex.value = newChangeIndex;
+          // 更新change_index：以快照实际返回的为准（引擎对越界索引会钳到边界快照，
+          // 此时发生吸附，弹窗需展示实际位移而不是请求步数）
+          const returnedChangeIndex = snapshot.change_index != null ? snapshot.change_index : newChangeIndex;
+          changeIndex.value = returnedChangeIndex;
           // 从snapshot中提取orderIndex和snapshotId
           orderIndex.value = snapshot.snapshot_id || res.data.orderindex || 0;
           snapshotId.value = snapshot.snapshot_id || 0;
@@ -2123,8 +2148,16 @@
 
           // 计算移动方向和数量
           const direction = intevel > 0 ? '向前' : '向后';
-          const count = Math.abs(intevel);
-          createMessage.success(`订单移动成功：${direction}移动${count}个订单`);
+          if (returnedChangeIndex !== newChangeIndex) {
+            const actualCount = Math.abs(returnedChangeIndex - prevChangeIndex);
+            createMessage.info(
+              `已到达当天${intevel > 0 ? '最后' : '最早'}一个变化点，实际${direction}移动${actualCount}个订单至 ${selectTime.value}` +
+              formatJumpShift(prevTime, prevOrderIndex, selectTime.value, orderIndex.value),
+            );
+          } else {
+            const count = Math.abs(intevel);
+            createMessage.success(`订单移动成功：${direction}移动${count}个订单`);
+          }
 
           // 更新市场数据
           updateMarketData();

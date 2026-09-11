@@ -4,16 +4,27 @@ TradeBook路由
 提供TradeBook相关的API接口
 """
 import os
+import time as _time
 import pandas as pd
 from fastapi import APIRouter, HTTPException, Depends
 from typing import Dict, Any, Optional
 import datetime as dt
+from ordervis_server.package import backend_logger
 from ordervis_server.utils.shared_storage import get_shared_storage, is_orderbook_fund_code
 from ordervis_server.utils.tradebook import DEFAULT_DATA_PATH
 from ordervis_server.utils.auth import get_current_user
 from ordervis_server.utils.utils import get_data_sqlserver, subtract_milliseconds
 
 router = APIRouter(prefix="/tradebook", tags=["TradeBook"])
+
+_perf_logger = backend_logger.Log("tradebook")
+_perf_level = backend_logger.LogLevel
+
+
+def _perf_log(endpoint: str, sym: str, date: str, extra: str, start: float):
+    """逐请求耗时日志，写入 log/YYYY-MM-DD_tradebook.log，用于排查跳转慢。"""
+    elapsed_ms = (_time.perf_counter() - start) * 1000
+    _perf_logger.n_log(f"[PERF] {endpoint} {sym}_{date} {extra} → {elapsed_ms:.1f}ms", _perf_level.INFO)
 
 @router.get("/DateList", summary="获取交易日列表")
 async def dateList(
@@ -157,7 +168,9 @@ async def snapshot_by_time(
     
     try:
         # 获取指定时间的快照
+        t0 = _time.perf_counter()
         snapshot_data = tradebook.get_snapshot_by_time(time)
+        _perf_log("snapshot_by_time", sym, date, time, t0)
         
         if snapshot_data is None:
             return {
@@ -251,7 +264,9 @@ async def snapshot_by_index(
     
     try:
         # 获取指定索引的快照
+        t0 = _time.perf_counter()
         snapshot_data = tradebook.get_snapshot_by_index(index)
+        _perf_log("snapshot_by_index", sym, date, f"index={index}", t0)
         
         if snapshot_data is None:
             return {
@@ -301,7 +316,9 @@ async def next_change(
         }
 
     try:
+        t0 = _time.perf_counter()
         snapshot_data = tradebook.get_adjacent_change(time, direction)
+        _perf_log("next_change", sym, date, f"{time} dir={direction}", t0)
 
         if snapshot_data is None:
             return {
@@ -356,7 +373,9 @@ async def trade_flow_series(
         }
 
     try:
+        t0 = _time.perf_counter()
         series = tradebook.get_trade_flow_series(time, window_ms, points)
+        _perf_log("trade_flow_series", sym, date, f"{time} win={window_ms}ms pts={points}", t0)
 
         return {
             "code": 0,
@@ -557,15 +576,16 @@ async def pastTimeTradeInfo(
 ):
     storage = get_shared_storage()
     tradebook = storage.get(sym, date)
-    
+
     if not tradebook:
         return {
             "code": 1,
             "data": None,
             "message": f"TradeBook {sym}_{date} 不存在"
         }
-    
+
     try:
+        t0 = _time.perf_counter()
         # 定义时间间隔和对应的键名
         time_intervals = {
             "last_1min": 60 * 1000,
@@ -622,7 +642,8 @@ async def pastTimeTradeInfo(
             for key in time_intervals.keys():
                 item[key] = result[key][i]
             res_data.append(item)
-    
+
+        _perf_log("pastTimeTradeInfo", sym, date, time, t0)
         return {
             "code": 0,
             "data": res_data,
